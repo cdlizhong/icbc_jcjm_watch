@@ -13,15 +13,35 @@ rumps.Timer 在主线程把最新结果刷新到顶部菜单栏：
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import subprocess
 import threading
 import webbrowser
 from datetime import datetime
+from pathlib import Path
 
 import httpx
 import rumps
 
 import jcjm_watch as jw
+
+# 价格提醒配置文件路径
+ALERT_CONFIG_PATH = Path.home() / "Library" / "Application Support" / "积存金行情" / "alerts.json"
+
+
+def _notify(title: str, subtitle: str, message: str, sound: str = "Glass") -> None:
+    """用 osascript 发送系统通知（比 rumps.notification 在 macOS 12+ 更可靠）。"""
+    script = (
+        f'display notification "{message}" '
+        f'with title "{title}" '
+        f'subtitle "{subtitle}" '
+        f'sound name "{sound}"'
+    )
+    try:
+        subprocess.run(["osascript", "-e", script], check=False, timeout=5)
+    except Exception:
+        pass
 
 # 可选刷新间隔（秒）；与命令行工具一致，不建议低于 30 秒以免触发行方限流
 INTERVAL_CHOICES = [30, 60, 120, 300]
@@ -29,6 +49,125 @@ DEFAULT_INTERVAL = 60
 
 # 状态栏/菜单里错误文案最大长度，避免超长 URL 异常撑宽菜单
 MAX_ERROR_IN_MENU = 60
+
+
+class AlertManager:
+    """价格提醒：管理低价/高价阈值，穿越时发系统通知，持久化到 JSON。"""
+
+    def __init__(self) -> None:
+        self._low: float | None = None
+        self._high: float | None = None
+        self._enabled: bool = True
+        # 上次价格所处区间："below" / "between" / "above"；None 表示尚未初始化
+        self._prev_zone: str | None = None
+        self._load()
+
+    # ---------- 属性 ----------
+
+    @property
+    def low(self) -> float | None:
+        return self._low
+
+    @property
+    def high(self) -> float | None:
+        return self._high
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    @property
+    def is_alerting(self) -> bool:
+        """当前是否处于触发区间（低于低价或高于高价）。"""
+        return self._prev_zone in ("below", "above")
+
+    # ---------- 设置/清除 ----------
+
+    def set_low(self, val: float | None) -> None:
+        self._low = val
+        self._prev_zone = None  # 重置状态，下次检查时若已在区间内则触发
+        self._save()
+
+    def set_high(self, val: float | None) -> None:
+        self._high = val
+        self._prev_zone = None
+        self._save()
+
+    def toggle(self) -> None:
+        self._enabled = not self._enabled
+        self._prev_zone = None
+        self._save()
+
+    def clear(self) -> None:
+        self._low = None
+        self._high = None
+        self._prev_zone = None
+        self._save()
+
+    # ---------- 检查 ----------
+
+    def check(self, live_price: float | None) -> None:
+        if not self._enabled or live_price is None:
+            return
+        if self._low is None and self._high is None:
+            return
+
+        new_zone = "between"
+        if self._low is not None and live_price <= self._low:
+            new_zone = "below"
+        elif self._high is not None and live_price >= self._high:
+            new_zone = "above"
+
+        if self._prev_zone is None:
+            # 首次检查（启动或刚设置阈值）：已在触发区间则立即通知
+            if new_zone == "below":
+                _notify(
+                    "积存金低价提醒",
+                    f"当前价 {live_price:.2f}",
+                    f"已低于 {self._low:.2f}，可考虑买入",
+                )
+            elif new_zone == "above":
+                _notify(
+                    "积存金高价提醒",
+                    f"当前价 {live_price:.2f}",
+                    f"已高于 {self._high:.2f}，可考虑卖出",
+                )
+        elif new_zone != self._prev_zone:
+            # 区间变化才通知
+            if new_zone == "below":
+                _notify(
+                    "积存金低价提醒",
+                    f"当前价 {live_price:.2f}",
+                    f"已跌破 {self._low:.2f}，可考虑买入",
+                )
+            elif new_zone == "above":
+                _notify(
+                    "积存金高价提醒",
+                    f"当前价 {live_price:.2f}",
+                    f"已突破 {self._high:.2f}，可考虑卖出",
+                )
+        self._prev_zone = new_zone
+
+    # ---------- 持久化 ----------
+
+    def _load(self) -> None:
+        try:
+            data = json.loads(ALERT_CONFIG_PATH.read_text("utf-8"))
+            self._low = data.get("low")
+            self._high = data.get("high")
+            self._enabled = data.get("enabled", True)
+        except (FileNotFoundError, json.JSONDecodeError, TypeError):
+            pass  # 首次运行或文件损坏，用默认值
+
+    def _save(self) -> None:
+        ALERT_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ALERT_CONFIG_PATH.write_text(
+            json.dumps(
+                {"low": self._low, "high": self._high, "enabled": self._enabled},
+                ensure_ascii=False,
+            ),
+            "utf-8",
+        )
 
 
 class QuoteStore:
@@ -178,10 +317,16 @@ class JCJMMenuBarApp(rumps.App):
         super().__init__("积存金行情", title="金 …", quit_button=None)
         self.store = store
         self.wake = wake
+        self.alerts = AlertManager()
         self._last_version = -1
+        self._base_title = "金 …"
+        self._flash_on = False
         # 每 2 秒在主线程检查一次：仅在数据版本变化时重建菜单/标题
         self._timer = rumps.Timer(self._on_ui_tick, 2)
         self._timer.start()
+        # 闪烁计时器：提醒中每 0.8 秒切换 🔔 显示/隐藏
+        self._flash_timer = rumps.Timer(self._on_flash_tick, 0.8)
+        self._flash_timer.start()
 
     # ---------- UI 构建 ----------
 
@@ -192,7 +337,7 @@ class JCJMMenuBarApp(rumps.App):
         self._last_version = snap["version"]
         live, low, high, sell = _bar_prices(snap)
         if live is None and low is None and high is None and sell is None:
-            self.title = "金 --"
+            self._base_title = "金 --"
         else:
             parts = []
             if live is not None:
@@ -203,10 +348,35 @@ class JCJMMenuBarApp(rumps.App):
                 parts.append(f"高{high}")
             if sell is not None:
                 parts.append(f"卖{sell}")
-            self.title = "金 " + " ".join(parts)
+            self._base_title = "金 " + " ".join(parts)
+        # 价格提醒检查（仅在拿到实时价时）
+        if live is not None:
+            try:
+                self.alerts.check(float(live.replace(",", "")))
+            except ValueError:
+                pass
+        # 标题：提醒中由闪烁计时器接管，否则直接显示
+        if self.alerts.is_alerting:
+            self._flash_on = True
+            self.title = "🔔 " + self._base_title
+        else:
+            self._flash_on = False
+            self.title = self._base_title
         # rumps 的 menu setter 只做增量 update，重建前必须清空，否则菜单项会累积
         self.menu.clear()
         self.menu = self._build_menu(snap)
+
+    def _on_flash_tick(self, _sender) -> None:
+        """提醒中时每 0.8 秒切换 🔔 显示/隐藏，形成闪烁效果。"""
+        if self.alerts.is_alerting:
+            self._flash_on = not self._flash_on
+            if self._flash_on:
+                self.title = "🔔 " + self._base_title
+            else:
+                self.title = self._base_title
+        elif self._flash_on:
+            self._flash_on = False
+            self.title = self._base_title
 
     def _build_menu(self, snap: dict) -> list:
         headers, rows = snap["headers"], snap["rows"]
@@ -250,6 +420,21 @@ class JCJMMenuBarApp(rumps.App):
         proxy_mi.state = 0 if snap["trust_env"] else 1
         items.append(proxy_mi)
 
+        # 价格提醒子菜单
+        alert_sub: list = []
+        low_text = f"≤{self.alerts.low:.2f}" if self.alerts.low is not None else "未设置"
+        high_text = f"≥{self.alerts.high:.2f}" if self.alerts.high is not None else "未设置"
+        alert_sub.append(rumps.MenuItem(f"当前: 低{low_text}  高{high_text}"))
+        alert_sub.append(None)
+        alert_sub.append(rumps.MenuItem("设置低价提醒…", callback=self._set_low_alert))
+        alert_sub.append(rumps.MenuItem("设置高价提醒…", callback=self._set_high_alert))
+        alert_sub.append(None)
+        toggle_alert = rumps.MenuItem("开启提醒", callback=self._toggle_alerts)
+        toggle_alert.state = 1 if self.alerts.enabled else 0
+        alert_sub.append(toggle_alert)
+        alert_sub.append(rumps.MenuItem("清除所有提醒", callback=self._clear_alerts))
+        items.append((rumps.MenuItem("价格提醒"), alert_sub))
+
         items.append(rumps.MenuItem("立即刷新", callback=self._refresh_now))
         items.append(rumps.MenuItem("在浏览器打开行情页", callback=self._open_source))
         items.append(None)
@@ -275,6 +460,63 @@ class JCJMMenuBarApp(rumps.App):
 
     def _open_source(self, _sender) -> None:
         webbrowser.open(self.store.url)
+
+    # ---------- 价格提醒回调 ----------
+
+    def _set_low_alert(self, _sender) -> None:
+        cur = str(self.alerts.low) if self.alerts.low is not None else ""
+        resp = rumps.Window(
+            message="输入低于此价格则提醒买入（留空清除）",
+            title="设置低价提醒",
+            default_text=cur,
+            dimensions=(200, 30),
+        ).run()
+        if not resp.clicked:
+            return
+        text = resp.text.strip()
+        if not text:
+            self.alerts.set_low(None)
+            self.store.touch()
+            _notify("价格提醒", "", "低价提醒已清除")
+            return
+        try:
+            self.alerts.set_low(float(text))
+            self.store.touch()
+            _notify("价格提醒", "", f"低价提醒已设置: ≤{text}")
+        except ValueError:
+            _notify("输入无效", "", "请输入数字")
+
+    def _set_high_alert(self, _sender) -> None:
+        cur = str(self.alerts.high) if self.alerts.high is not None else ""
+        resp = rumps.Window(
+            message="输入高于此价格则提醒卖出（留空清除）",
+            title="设置高价提醒",
+            default_text=cur,
+            dimensions=(200, 30),
+        ).run()
+        if not resp.clicked:
+            return
+        text = resp.text.strip()
+        if not text:
+            self.alerts.set_high(None)
+            self.store.touch()
+            _notify("价格提醒", "", "高价提醒已清除")
+            return
+        try:
+            self.alerts.set_high(float(text))
+            self.store.touch()
+            _notify("价格提醒", "", f"高价提醒已设置: ≥{text}")
+        except ValueError:
+            _notify("输入无效", "", "请输入数字")
+
+    def _toggle_alerts(self, _sender) -> None:
+        self.alerts.toggle()
+        self.store.touch()
+
+    def _clear_alerts(self, _sender) -> None:
+        self.alerts.clear()
+        self.store.touch()
+        _notify("价格提醒", "", "所有提醒已清除")
 
 
 def main(argv: list[str] | None = None) -> int:
