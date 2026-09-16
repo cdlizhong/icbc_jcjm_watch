@@ -55,7 +55,7 @@ pip install pyinstaller rumps pyobjc httpx beautifulsoup4 rich
 pyinstaller jcjm_menubar.spec --noconfirm
 ```
 
-产物在 `dist/积存金行情.app`，双击即可运行。菜单栏显示：`金 935.76 低925.38 高938.07 卖931.08`
+产物在 `dist/积存金行情.app`，双击即可运行。菜单栏显示：`金 xxx.xx 低xxx.xx 高xxx.xx 卖xxx.xx`
 
 下拉菜单可查看各产品全部列明细、切换刷新间隔（30/60/120/300 秒）、开关代理直连、在浏览器打开行情源页。
 
