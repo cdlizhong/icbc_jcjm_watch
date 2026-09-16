@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- 基础 Python 来自 Xcode/CLT（Apple 平台签名），复制进 .app 后被 ad-hoc 重签，
+       不关闭库校验会被硬化运行时拒绝加载（no Team ID）。仅自用分发所需。 -->
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+  <!-- pyobjc/libffi 创建 FFI 闭包需要可执行内存，否则启动时报
+       objc.error: Cannot create libffi closure（双击表现为"应用没有响应"）。 -->
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+</dict>
+</plist>

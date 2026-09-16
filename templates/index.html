@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>工行积存金行情</title>
+  <!-- 样式：浅色卡片 + 表格横向滚动（移动端）、表头吸顶、数字列右对齐 -->
+  <style>
+    :root {
+      --bg: #f0f2f5;
+      --card: #fff;
+      --text: #1a1a1a;
+      --muted: #5c6370;
+      --border: #e1e4e8;
+      --accent: #c41230;
+      --ok: #0d7d4d;
+      --err: #b00020;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      min-height: 100vh;
+    }
+    .wrap {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 1.25rem 1rem 2rem;
+    }
+    header {
+      margin-bottom: 1rem;
+    }
+    h1 {
+      margin: 0 0 0.35rem;
+      font-size: 1.35rem;
+      font-weight: 600;
+    }
+    .meta {
+      font-size: 0.875rem;
+      color: var(--muted);
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem 1.25rem;
+    }
+    .meta strong { color: var(--text); font-weight: 500; }
+    .card {
+      background: var(--card);
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      box-shadow: 0 1px 3px rgba(0,0,0,.06);
+      overflow: hidden;
+    }
+    .scroll {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.9rem;
+    }
+    th, td {
+      padding: 0.65rem 0.85rem;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    th {
+      background: #fafbfc;
+      font-weight: 600;
+      color: #333;
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }
+    tbody tr:nth-child(even) { background: #fafbfc; }
+    tbody tr:hover { background: #f3f5f7; }
+    td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .status {
+      padding: 0.75rem 1rem;
+      font-size: 0.875rem;
+      border-top: 1px solid var(--border);
+      background: #fafbfc;
+      color: var(--muted);
+    }
+    .status.ok .dot { color: var(--ok); }
+    .status.err { color: var(--err); }
+    .dot::before { content: "● "; }
+    footer {
+      margin-top: 1.25rem;
+      font-size: 0.75rem;
+      color: var(--muted);
+      word-break: break-all;
+    }
+    footer a { color: var(--accent); }
+    .loading {
+      padding: 2rem;
+      text-align: center;
+      color: var(--muted);
+    }
+    .chart-section {
+      border-top: 1px solid var(--border);
+      padding: 1rem 1rem 0.5rem;
+      background: #fafbfc;
+    }
+    .chart-section h2 {
+      margin: 0 0 0.75rem;
+      font-size: 0.95rem;
+      font-weight: 600;
+      color: #333;
+    }
+    .chart-canvas-wrap {
+      position: relative;
+      height: 260px;
+      margin-bottom: 0.5rem;
+    }
+    .chart-placeholder {
+      padding: 2rem 1rem;
+      text-align: center;
+      color: var(--muted);
+      font-size: 0.875rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>工行积存金行情</h1>
+      <div class="meta">
+        <span>本地刷新周期：<strong id="poll-hint">—</strong></span>
+        <span>接口拉取时间：<strong id="fetched-at">—</strong></span>
+        <span>页面更新时间：<strong id="page-update">—</strong></span>
+      </div>
+    </header>
+    <div class="card">
+      <div id="table-area" class="scroll">
+        <div class="loading" id="loading">正在加载…</div>
+      </div>
+      <div class="chart-section">
+        <h2>积存金价格走势（本次服务启动以来）</h2>
+        <div id="chart-placeholder" class="chart-placeholder">等待拉取数据，将按刷新周期记录价格并绘图…</div>
+        <div id="chart-canvas-wrap" class="chart-canvas-wrap" hidden>
+          <canvas id="price-chart" aria-label="积存金价格折线图"></canvas>
+        </div>
+      </div>
+      <div class="status ok" id="status-line">
+        <span class="dot" id="status-text">等待数据</span>
+      </div>
+    </div>
+    <footer>
+      数据来自工行公开行情页（仅供查阅，以银行柜台为准）。
+      <a href="{{ source_url }}" target="_blank" rel="noopener">数据源链接</a>
+    </footer>
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script>
+    /* 与后端后台拉取间隔一致，前端定时请求 /api/quote 刷新展示 */
+    const POLL_MS = {{ poll_interval_ms }};
+
+    /** 单元格是否视为数字（含空/横线占位），用于决定是否右对齐 */
+    function isNumericCell(s) {
+      const t = (s || "").trim();
+      if (!t || t === "—" || t === "---") return true;
+      return !isNaN(parseFloat(t.replace(/,/g, "")));
+    }
+
+    /** 表头/数据格 CSS 类：首列左对齐，数字列加 .num */
+    function headerNumClass(headers, bodyRows, colIdx) {
+      if (colIdx === 0) return "";
+      if (!bodyRows.length) return " num";
+      return bodyRows.every(r => isNumericCell(r[colIdx])) ? " num" : "";
+    }
+
+    /** 根据接口返回的 headers + rows 拼出表格 HTML（先转义防 XSS） */
+    function renderTable(headers, rows) {
+      const area = document.getElementById("table-area");
+      if (!headers.length) {
+        area.innerHTML = '<div class="loading">暂无表格数据</div>';
+        return;
+      }
+      const thead = "<tr>" + headers.map((h, i) =>
+        `<th class="${headerNumClass(headers, rows, i)}">${escapeHtml(h)}</th>`
+      ).join("") + "</tr>";
+      const tbody = rows.map(r => "<tr>" + r.map((c, i) =>
+        `<td class="${headerNumClass(headers, rows, i)}">${escapeHtml(c || "—")}</td>`
+      ).join("") + "</tr>").join("");
+      area.innerHTML = `<table><thead>${thead}</thead><tbody id="quote-body">${tbody}</tbody></table>`;
+    }
+
+    /** 文本插入 DOM 前转义，避免行情字段中含特殊字符破坏页面 */
+    function escapeHtml(s) {
+      const d = document.createElement("div");
+      d.textContent = s;
+      return d.innerHTML;
+    }
+
+    let priceChart = null;
+
+    const CHART_COLORS = ["#c41230", "#0d7d4d", "#1a5fb4", "#9141ac", "#c64600", "#355263"];
+
+    function formatChartLabel(iso) {
+      const d = new Date(iso);
+      if (Number.isNaN(d.getTime())) return iso || "—";
+      return d.toLocaleString("zh-CN", {
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+      });
+    }
+
+    /** 根据 /api/quote 的 price_history 更新折线图 */
+    function updatePriceChart(history) {
+      const ph = document.getElementById("chart-placeholder");
+      const wrap = document.getElementById("chart-canvas-wrap");
+      const canvas = document.getElementById("price-chart");
+      if (!history || !history.length) {
+        ph.hidden = false;
+        ph.textContent = "等待拉取数据，将按刷新周期记录价格并绘图…";
+        wrap.hidden = true;
+        if (priceChart) {
+          priceChart.destroy();
+          priceChart = null;
+        }
+        return;
+      }
+      ph.hidden = true;
+      wrap.hidden = false;
+      const labels = history.map((h) => formatChartLabel(h.t));
+      const keys = new Set();
+      history.forEach((h) => {
+        const p = h.prices || {};
+        Object.keys(p).forEach((k) => keys.add(k));
+      });
+      const keyList = [...keys].sort();
+      const datasets = keyList.map((k, i) => ({
+        label: k,
+        data: history.map((h) => {
+          const v = h.prices && h.prices[k];
+          return v !== undefined && v !== null ? v : null;
+        }),
+        borderColor: CHART_COLORS[i % CHART_COLORS.length],
+        backgroundColor: "transparent",
+        tension: 0.25,
+        spanGaps: true,
+        pointRadius: 0,
+        pointHitRadius: 6,
+        borderWidth: 2,
+      }));
+      const ctx = canvas.getContext("2d");
+      if (priceChart) {
+        priceChart.data.labels = labels;
+        priceChart.data.datasets = datasets;
+        priceChart.update("none");
+      } else {
+        priceChart = new Chart(ctx, {
+          type: "line",
+          data: { labels, datasets },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: { mode: "index", intersect: false },
+            plugins: {
+              legend: { position: "top", labels: { boxWidth: 12, font: { size: 11 } } },
+              tooltip: {
+                callbacks: {
+                  label(ctx) {
+                    const v = ctx.parsed.y;
+                    if (v === null || v === undefined) return ctx.dataset.label + ": —";
+                    return ctx.dataset.label + ": " + v;
+                  },
+                },
+              },
+            },
+            scales: {
+              x: {
+                ticks: { maxRotation: 45, autoSkip: true, maxTicksLimit: 14, font: { size: 10 } },
+                grid: { display: false },
+              },
+              y: {
+                title: { display: true, text: "价格", font: { size: 11 } },
+                ticks: { font: { size: 10 } },
+              },
+            },
+          },
+        });
+      }
+    }
+
+    /** 底部状态条：成功绿色 / 失败红色 */
+    function setStatus(ok, msg) {
+      const el = document.getElementById("status-line");
+      const tx = document.getElementById("status-text");
+      el.classList.toggle("ok", ok);
+      el.classList.toggle("err", !ok);
+      tx.textContent = msg;
+    }
+
+    /** 拉取 JSON 并更新元信息、表格或错误提示 */
+    async function refresh() {
+      try {
+        const res = await fetch("/api/quote", { cache: "no-store" });
+        const d = await res.json();
+        document.getElementById("poll-hint").textContent = (d.interval_sec || 60) + " 秒";
+        document.getElementById("fetched-at").textContent = d.fetched_at || "—";
+        document.getElementById("page-update").textContent = d.page_update || "—";
+
+        updatePriceChart(d.price_history || []);
+
+        if (d.ok && d.headers && d.headers.length) {
+          renderTable(d.headers, d.rows || []);
+          setStatus(true, "数据正常");
+        } else if (d.error) {
+          document.getElementById("table-area").innerHTML =
+            '<div class="loading">本次拉取失败，将按周期重试。</div>';
+          setStatus(false, d.error);
+        } else {
+          renderTable(d.headers || [], d.rows || []);
+          setStatus(true, "等待首次拉取完成…");
+        }
+      } catch (e) {
+        setStatus(false, "请求失败: " + e);
+      }
+    }
+
+    refresh();
+    setInterval(refresh, POLL_MS);  /* 与 POLL_MS 同步轮询 */
+  </script>
+</body>
+</html>

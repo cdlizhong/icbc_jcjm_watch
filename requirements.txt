@@ -1,0 +1,8 @@
+httpx>=0.27.0
+beautifulsoup4>=4.12.0
+rich>=13.0.0
+flask>=3.0.0
+# macOS 菜单栏应用（menubar_app.py）
+rumps>=0.4.0
+# 仅打包 .app 时需要：pyinstaller jcjm_menubar.spec --noconfirm
+pyinstaller>=6.0.0
