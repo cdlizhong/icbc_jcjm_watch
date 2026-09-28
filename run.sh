@@ -16,5 +16,9 @@ case "${1:-}" in
     shift
     exec .venv/bin/python menubar_app.py "$@"
     ;;
+  monitor)
+    shift
+    exec .venv/bin/python monitor.py "$@"
+    ;;
 esac
 exec .venv/bin/python jcjm_watch.py "$@"
